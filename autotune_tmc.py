@@ -18,6 +18,9 @@ COOLSTEP_THRS_FACTOR = 0.75
 FULLSTEP_THRS_FACTOR = 1.2
 MULTISTEP_FILT = True
 
+# 2240-specific parameters
+SLOPE_CONTROL = 3
+
 # PWM parameters
 PWM_AUTOSCALE = True # Setup pwm autoscale even if we won't use PWM, because it
                      # gives more data about the motor and is needed for CoolStep.
@@ -54,7 +57,7 @@ PWM_FREQ_TARGETS = {"tmc2130": 55e3,
                     "tmc5160": 55e3}
 
 
-AUTO_PERFORMANCE_MOTORS = {'stepper_x', 'stepper_y', 'stepper_x1', 'stepper_y1', 'stepper_a', 'stepper_b', 'stepper_c'}
+AUTO_PERFORMANCE_MOTORS = {'stepper_x', 'stepper_y', 'dual_carriage', 'stepper_x1', 'stepper_y1', 'stepper_a', 'stepper_b', 'stepper_c'}
 
 class TuningGoal(str, Enum):
     AUTO = "auto" # This is the default: automatically choose SILENT for Z and PERFORMANCE for X/Y
@@ -113,7 +116,6 @@ class AutotuneTMC:
         self.auto_silent = False # Auto silent off by default
         self.tmc_object=None # look this up at connect time
         self.tmc_cmdhelper=None # Ditto
-        self.tmc_init_registers=None # Ditto
         self.run_current = 0.0
         self.fclk = None
         self.motor_object = None
@@ -124,6 +126,13 @@ class AutotuneTMC:
         self.tpfd = config.getint('tpfd', default=None, minval=0, maxval=15)
         self.sgt = config.getint('sgt', default=SGT, minval=-64, maxval=63)
         self.sg4_thrs = config.getint('sg4_thrs', default=SG4_THRS, minval=0, maxval=255)
+        # Coolstep Tunables
+        self.se_min = config.getint("semin", default=SEMIN, minval=0, maxval=15)
+        self.se_max = config.getint("semax", default=SEMAX, minval=0, maxval=15)
+        self.se_up = config.getint("seup", default=SEUP, minval=0, maxval=3)
+        self.se_down = config.getint("sedn", default=SEDN, minval=0, maxval=3)
+        self.se_imin = config.getint("seimin", default=SEIMIN, minval=0, maxval=1)
+
         self.voltage = config.getfloat('voltage', default=VOLTAGE, minval=0.0, maxval=60.0)
         self.overvoltage_vth = config.getfloat('overvoltage_vth', default=OVERVOLTAGE_VTH,
                                               minval=0.0, maxval=60.0)
@@ -164,8 +173,6 @@ class AutotuneTMC:
       self.printer.reactor.register_callback(self._handle_ready_deferred)
 
     def _handle_ready_deferred(self, eventtime):
-        if self.tmc_init_registers is not None:
-            self.tmc_init_registers(print_time=print_time)
         try:
             self.fclk = self.tmc_object.mcu_tmc.get_tmc_frequency()
         except AttributeError:
@@ -177,7 +184,7 @@ class AutotuneTMC:
     cmd_AUTOTUNE_TMC_help = "Apply autotuning configuration to TMC stepper driver"
     def cmd_AUTOTUNE_TMC(self, gcmd):
         logging.info("AUTOTUNE_TMC %s", self.name)
-        tgoal = gcmd.get('TUNING_GOAL', TUNING_GOAL).lower()
+        tgoal = gcmd.get('TUNING_GOAL', None)
         if tgoal is not None:
             try:
                 self.tuning_goal = TuningGoal(tgoal)
@@ -242,6 +249,8 @@ class AutotuneTMC:
         self._setup_coolstep(coolthrs)
         self._setup_highspeed(FULLSTEP_THRS_FACTOR * vmaxpwm)
         self._set_driver_field('multistep_filt', MULTISTEP_FILT)
+        # Cool down 2240s
+        self._set_driver_field('slope_control', SLOPE_CONTROL)
 
 
     def _set_driver_field(self, field, arg):
@@ -291,11 +300,18 @@ class AutotuneTMC:
                          if self.fclk*i[1] < self.pwm_freq_target))[0]
         self._set_driver_field('pwm_freq', pwm_freq)
 
+    def _tblank_cycles(self):
+        if self.driver_type in ["tmc2208", "tmc2209"]:
+            tblank_cycles = [16, 24, 32, 40]
+        else:
+            tblank_cycles = [16, 24, 36, 54]
+        return tblank_cycles[self.tbl]
+
     def _set_hysteresis(self, run_current):
         hstrt, hend = self.motor_object.hysteresis(
             volts=self.voltage,
             current=run_current,
-            tbl=self.tbl,
+            tblank_cycles=self._tblank_cycles(),
             toff=self.toff,
             fclk=self.fclk,
             extra=self.extra_hysteresis)
@@ -339,6 +355,11 @@ class AutotuneTMC:
         self._set_driver_field('pwm_reg', PWM_REG)
         self._set_driver_field('pwm_lim', PWM_LIM)
         if tgoal == TuningGoal.AUTOSWITCH:
+            logging.info(
+                "autotune_tmc set %s autoswitch velocity limit to %.3f",
+                self.name,
+                pwmthrs,
+            )
             self._set_driver_velocity_field('tpwmthrs', pwmthrs)
             self._set_driver_field('en_pwm_mode', True)
             self._set_driver_field('en_spreadcycle', False) # TMC2208 use en_spreadcycle instead of en_pwm_mode
@@ -365,7 +386,7 @@ class AutotuneTMC:
             # blank time of 16 cycles will not work in this case
             self.tbl = 1
 
-        pfdcycles = ncycles - (24 + 32 * self.toff) * 2 - [16, 34, 36, 54][self.tbl]
+        pfdcycles = ncycles - (24 + 32 * self.toff) * 2 - self._tblank_cycles()
         if self.tpfd is None:
             self.tpfd = max(0, min(15, int(math.ceil(pfdcycles / 128))))
 
@@ -380,11 +401,11 @@ class AutotuneTMC:
         self._set_driver_field('sgt', self.sgt)
         self._set_driver_field('fast_standstill', FAST_STANDSTILL)
         self._set_driver_field('small_hysteresis', SMALL_HYSTERESIS)
-        self._set_driver_field('semin', SEMIN)
-        self._set_driver_field('semax', SEMAX)
-        self._set_driver_field('seup', SEUP)
-        self._set_driver_field('sedn', SEDN)
-        self._set_driver_field('seimin', SEIMIN)
+        self._set_driver_field("semin", self.se_min)
+        self._set_driver_field("semax", self.se_max)
+        self._set_driver_field("seup", self.se_up)
+        self._set_driver_field("sedn", self.se_down)
+        self._set_driver_field("seimin", self.se_imin)
         self._set_driver_field('sfilt', SFILT)
         self._set_driver_field('iholddelay', IHOLDDELAY)
         self._set_driver_field('irundelay', IRUNDELAY)
